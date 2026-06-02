@@ -1,2 +1,2 @@
 # test_ptqlite
-test
+test_ptqlite
