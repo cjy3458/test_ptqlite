@@ -11,6 +11,13 @@
 const STORAGE_KEY    = 'kb_qc_db_v1';
 const GEMINI_KEY_LOC = 'kb_qc_gemini_key';
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   ▼▼▼ Gemini API 키 — 여기에 발급받은 키를 붙여넣으면 AI 모드로 동작합니다 ▼▼▼
+   예) const GEMINI_API_KEY = 'AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+   비워 두면(''), 규칙 기반 모드로 자동 폴백합니다 (별도 화면 입력 UI 없음).
+   ═══════════════════════════════════════════════════════════════════════════ */
+const GEMINI_API_KEY = '';
+
 /* ── 저장소 ──────────────────────────────────────────────────────────────── */
 function emptyDB() {
   return {
@@ -40,7 +47,8 @@ class ApiError extends Error {
 /* ═══════════════════════════════════════════════════════════════════════════
    Gemini API 키 관리
    ═══════════════════════════════════════════════════════════════════════════ */
-function getGeminiKey()    { return localStorage.getItem(GEMINI_KEY_LOC) || ''; }
+// 코드 상수(GEMINI_API_KEY) 우선, 없으면 localStorage 폴백
+function getGeminiKey()    { return (GEMINI_API_KEY || '').trim() || localStorage.getItem(GEMINI_KEY_LOC) || ''; }
 function setGeminiKey(key) {
   const k = (key || '').trim();
   if (k) localStorage.setItem(GEMINI_KEY_LOC, k);
@@ -66,6 +74,10 @@ async function callGemini(prompt) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
+    if (res.status === 429) {
+      // 할당량 초과 / 요청 제한 — 규칙 기반으로 폴백되도록 명확한 메시지로 throw
+      throw new ApiError(429, '일시적인 요청 제한입니다. 15초 후 다시 시도해 주세요.');
+    }
     throw new ApiError(res.status, err.error?.message || `Gemini API 오류 (${res.status})`);
   }
   const data = await res.json();
@@ -318,17 +330,17 @@ const DEMO_CASES_TEMPLATE = [
 
 const DEMO_ERRORS = {
   TC02: {
-    cat:'이번 테스트 특화 · 상품 정보', fail_step:3, policy:'GEA260601234352',
+    cat:'이번 테스트 특화 · 상품 정보', fail_step:4, policy:'GEA260601234352',
     title:'간암 치료 특약 가입연령 하한이 화면에 반영되지 않음',
-    repro:['남자 24세 피보험자로 가입설계 진입','신설 「간암 치료」 특약 선택','보험료 계산 → 차단·안내 없이 정상 산출됨'],
+    repro:['고객 등록 후 남자 24세 피보험자로 가입설계 진입','신설 「간암 치료」 특약 선택','보험료 계산 → 차단·안내 없이 정상 산출됨'],
     expect:'간암 치료 특약: 남자 25세·여자 30세부터 가입 가능 (하한 미만 선택 차단)',
     actual:'남자 24세에도 간암 치료 특약 선택·계산이 그대로 진행됨',
     has_screenshot:false,
   },
   TC04: {
-    cat:'문서 정합성', fail_step:5, policy:'GEA260601234274',
+    cat:'문서 정합성', fail_step:6, policy:'GEA260601234274',
     title:'특약명이 구버전으로 노출됨 (상품안 ↔ 화면 버전 불일치)',
-    repro:['딱좋은 0540 건강보험 가입설계 진입','특약 목록에서 암 관련 특약 확인','상품안(PSR) 개정본과 특약명 대조 → 버전 불일치 감지'],
+    repro:['딱좋은 0540 건강보험 가입설계 진입','특약 목록에서 암 관련 특약 확인','청약서 발행 단계에서 상품안(PSR) 개정본과 특약명 대조 → 버전 불일치 감지'],
     expect:'상품안 개정 반영 「암진단 III」 특약명 노출',
     actual:'구버전 특약명 「암진단 II」가 그대로 노출됨',
     has_screenshot:true,
@@ -348,6 +360,7 @@ function caseDict(c) {
     error_key: c.error_key ?? null, from_custom: !!c.from_custom, recheck_needed: !!c.recheck_needed,
   };
   if (r?.executed_at) d.executed_at = r.executed_at;
+  if (r) d.result = resultDict(r);   // 실행된 케이스의 단계/상태 정보 동봉 (단계 표시용)
   return d;
 }
 
@@ -444,17 +457,46 @@ function addCase(sid, p) {
   return caseDict(c);
 }
 
+/* 큐레이션된 데모 오류가 없는 (자동 생성) 케이스용 — 케이스 조합으로 그럴듯한 오류 데이터 합성 */
+function synthesizeError(c) {
+  const dev = `${c.device||'PC'}·${c.channel||'옴니'}`;
+  const gp  = c.contractor_insured || '계피동일';
+  const rider = (c.rider_scope || '').trim();
+  const scope = rider || '필수특약';
+  const title = `${scope} 부가 조건이 ${dev} 화면에 정상 반영되지 않음`;
+  const repro = [
+    `${dev} 환경에서 고객 등록 후 가입설계 진입 (${gp})`,
+    `특약 구성에서 「${scope}」 선택`,
+    `특약 선택 단계 진행 → 해당 조건의 검증·안내가 누락됨`,
+  ];
+  return {
+    cat: `${c.channel||'옴니'}청약 · 특약/청약 정합성`,
+    fail_step: 4,
+    policy: 'GEA' + (260601000000 + (c.id % 900000)).toString(),
+    title,
+    repro,
+    expect: `「${scope}」 부가 시 ${dev}에서 조건 검증·안내 문구가 정상 노출되어야 함`,
+    actual: `${dev}에서 「${scope}」 조건 검증·안내 없이 청약이 그대로 진행됨`,
+    has_screenshot: false,
+  };
+}
+
 function executeCase(sid, cid) {
   const c = db.cases.find(x=>x.id===Number(cid)&&x.session_id===Number(sid));
   if (!c) throw new ApiError(404, '케이스를 찾을 수 없어요');
 
   const outcome = c.expected_outcome;
-  const errData = (outcome==='오류'&&c.error_key) ? DEMO_ERRORS[c.error_key] : null;
+  // 데모 큐레이션 오류(error_key) 우선, 없으면 케이스 조합 기반으로 합성
+  const errData = outcome==='오류'
+    ? (c.error_key ? DEMO_ERRORS[c.error_key] : synthesizeError(c))
+    : null;
+  // 확인필요: 오류는 아니지만 사람이 확인해야 하는 단계를 표시 (청약서 발행·문구 점검 = 6단계)
+  const checkStep = outcome==='확인필요' ? 6 : null;
   db.results = db.results.filter(r=>r.case_id!==c.id);
 
   const result = {
     id:nextId('results'), case_id:c.id, status:outcome,
-    fail_step:      errData?errData.fail_step:null,
+    fail_step:      errData?errData.fail_step:checkStep,
     error_category: errData?errData.cat:null,
     error_title:    errData?errData.title:null,
     repro_steps:    errData?JSON.stringify(errData.repro):null,
@@ -486,7 +528,7 @@ function getResults(sid) {
   const allCases = cs.map(caseDict);
   allCases.forEach((cd, i) => {
     const r = resultOf(cs[i].id);
-    if (r && cd.status==='오류') cd.result = resultDict(r);
+    if (r) cd.result = resultDict(r);   // 오류·확인필요·통과 모두 단계 정보 전달
   });
   return {
     pass:  allCases.filter(c=>c.status==='통과'),
@@ -535,15 +577,92 @@ async function generateCasesHandler(sid) {
   };
 }
 
+/* ── 확인 포인트 추출 — 자연어 지시문 → QA 검증 명사구 ──────────────────────── */
+const CHECKPOINT_PROMPT = (text) => `너는 QA 테스트 요구사항을 간결하고 명확한 '확인 포인트'로 변환하는 테스트 설계 전문 AI야.
+사용자가 자연어로 테스트 지시사항을 입력하면, 아래 규칙에 따라 핵심만 추출하여 명사구 형태로 요약해 줘.
+
+[변환 규칙]
+1. 출력 형식: 반드시 "확인 포인트 ① [내용] ② [내용] ..." 형태로 기호를 사용하여 한 줄로 출력할 것.
+2. 명사화 및 압축: 사용자의 입력 문장을 그대로 복사하지 말 것. 불필요한 조사와 서술어를 제거하고 핵심 키워드 위주로 최대한 짧게 압축할 것.
+3. 종결 어미 통제: 각 포인트의 끝은 반드시 "~ 여부", "~ 노출 여부", "~ 차단 여부", "~ 처리 여부" 등 QA 검증 상태를 나타내는 명사구로 끝맺을 것.
+※ 🚫 절대 금지: "~하는지", "~표시되어", "~해야 함" 등 문장형/서술형 어미는 절대 사용하지 말 것
+
+[예시]
+입력: 출산•육아휴직 보험료 할인 특약 부가 시 전자청약•옴니청약 발행이 불가한지 확인해야 함. 청약서류 발행 전 안내 모달에도 사유 문구가 표시되어 있어야 함.
+출력: 확인 포인트 ① 전자•옴니 청약 발행 차단 여부 ② 청약서류 발행 전 안내 모달 사유 문구 노출 여부
+
+입력: 간암 특약 가입 시 나이가 25세 미만이면 오류 팝업이 뜨고 다음 화면으로 넘어가면 안 돼.
+출력: 확인 포인트 ① 가입 연령(25세 미만) 미달 시 오류 팝업 노출 여부 ② 다음 단계 진입 차단 여부
+
+입력: 여성이면 암특약 선택 불가해야 하고 남성이면 간암특약 선택 불가해야 함
+출력: 확인 포인트 ① 여성 암특약 선택 차단 여부 ② 남성 간암특약 선택 차단 여부
+
+※ 입력에 조건이 여러 개(예: "~하고", "~하며", "그리고")면 각각을 별도 확인 포인트로 분리할 것. 입력 조건 수와 출력 포인트 수가 일치해야 함.
+
+[입력 데이터]
+입력: ${text}
+출력:`;
+
+/* "확인 포인트 ① A ② B" 한 줄 → ['A','B'] */
+function parseCheckPointLine(line) {
+  const body = String(line || '').replace(/^[\s\S]*?확인\s*포인트\s*/, '').replace(/\n[\s\S]*$/, '').trim();
+  const parts = body.split(/[①②③④⑤⑥⑦⑧⑨⑩]/).map(s => s.replace(/^[\s,·]+|[\s,·]+$/g, '').trim()).filter(Boolean);
+  return parts.length ? parts : (body ? [body] : []);
+}
+
+async function checkPointsGemini(text) {
+  const raw = await callGemini(CHECKPOINT_PROMPT(text));
+  return parseCheckPointLine(raw);
+}
+
+/* 규칙 기반 폴백 — 시연 시드 입력은 정확히 매핑, 그 외에는 서술어 제거 명사구화 */
+function checkPointsRule(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (/출산.{0,2}육아휴직.*할인\s*특약.*(전자청약|옴니청약).*발행이?\s*불가/.test(t))
+    return ['전자•옴니 청약 발행 차단 여부', '청약서류 발행 전 안내 모달 사유 문구 노출 여부'];
+
+  // 문장 부호 + 접속어("~하고 / ~하며 / 그리고")로 분해해 복수 조건을 분리
+  const sents = t
+    .split(/[.。\n]+|\s*(?:하고|하며|그리고)\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 4);
+  const nounify = (s) => {
+    s = s.replace(/(확인해야\s*함|확인이?\s*필요(하다|함)?|확인하고\s*싶어요?|확인해\s*줘|점검해야\s*함|해야\s*함|해야\s*한다|있어야\s*함|있어야\s*한다|되어\s*있어야\s*함)\s*\.?$/g, '').trim();
+    s = s.replace(/(되는지|하는지|인지|한지)\s*\.?$/g, '').trim();
+    if (/불가|차단|막아|막혀|안\s*되|넘어가면\s*안/.test(s))
+      return s.replace(/(이|가)?\s*(불가|차단|막아|막혀).*$/, '').replace(/[\s,·]+$/, '').trim() + ' 차단 여부';
+    if (/표시|노출|뜨|보여|나타|팝업/.test(s))
+      return s.replace(/(이|가|에|에도)?\s*(표시|노출|뜨|보여|나타).*$/, '').replace(/[\s,·]+$/, '').trim() + ' 노출 여부';
+    if (/오류|에러|실패/.test(s))
+      return s.replace(/[\s,·]+$/, '').trim() + ' 오류 처리 여부';
+    return s.replace(/[\s,·]+$/, '').trim() + ' 정상 처리 여부';
+  };
+  const pts = sents.map(nounify).filter(Boolean).slice(0, 4);
+  return pts.length ? pts : ['입력 시나리오 정상 처리 여부'];
+}
+
+async function extractCheckPoints(text) {
+  if (isGeminiAvailable()) {
+    try {
+      const r = await checkPointsGemini(text);
+      if (r.length) return r;
+    } catch (e) {
+      console.warn('[AI] 확인 포인트 추출 실패 →', e.message, '· 규칙 기반으로 폴백');
+    }
+  }
+  return checkPointsRule(text);
+}
+
 async function caseFromTextHandler(sid, p) {
   const s = findSession(sid);
   if (!s) throw new ApiError(404, '세션을 찾을 수 없어요');
   const text = (p.text||'').trim();
   if (!text) throw new ApiError(400, '확인할 내용을 입력해주세요');
 
-  const result = await generateTestCases(s.name, [{
-    req_id:'USR-001', req_name:'사용자 직접 입력 확인 사항', req_content:text,
-  }]);
+  const [result, checkPoints] = await Promise.all([
+    generateTestCases(s.name, [{ req_id:'USR-001', req_name:'사용자 직접 입력 확인 사항', req_content:text }]),
+    extractCheckPoints(text),
+  ]);
   const tc = (result.test_cases||[{}])[0]||{};
 
   const c = {
@@ -556,7 +675,7 @@ async function caseFromTextHandler(sid, p) {
     status:'미실행', error_key:null, from_custom:true, recheck_needed:false, created_at:nowISO(),
   };
   db.cases.push(c);
-  return { case:caseDict(c), source:result.source||'rule', focus:tc.test_focus||'' };
+  return { case:caseDict(c), source:result.source||'rule', focus:tc.test_focus||'', check_points:checkPoints };
 }
 
 /* ── QC ── */
@@ -632,18 +751,18 @@ function deleteDocument(docId) {
 
 /* ── 데모 시드 ── */
 function seedDemo() {
-  if (db.sessions.find(s=>s.name==='딱좋은 0540 건강보험 신상품 테스트')) {
+  if (db.sessions.find(s=>s.name==='KB 딱좋은 0540 건강보험')) {
     const s = db.sessions.find(s=>s.status==='진행중');
     return { message:'이미 데모 데이터가 있어요', active_session_id:s?s.id:null };
   }
 
   const active = {
     id:nextId('sessions'),
-    name:'딱좋은 0540 건강보험 신상품 테스트',
+    name:'KB 딱좋은 0540 건강보험',
     product_code:'375000015',
     target_product:'딱좋은 0540 건강보험 무배당(일반심사형)(해약환급금 미지급형)(납입면제형)(사망보장형)',
-    parts:JSON.stringify(['상품개발파트','상품운영파트','혁신상품파트','계약심사파트','IT개발파트','계약관리파트','신계약업무파트']),
-    start_date:'2026-06-08', end_date:'2026-06-12', status:'진행중', deployed:true,
+    parts:JSON.stringify(['IT개발파트','IT기획운영파트','계약관리파트','계약심사파트','고객컨택파트','보험금파트','상품운영파트','신계약업무파트','영업추진파트','혁신상품파트']),
+    start_date:'2026-06-04', end_date:'2026-06-12', status:'진행중', deployed:true,
     nl_seed:'출산·육아휴직 보험료 할인 특약 부가 시 전자청약·옴니청약 발행이 불가한지 확인해야 함. 청약서류 발행 전 안내 모달에도 사유 문구가 표시되어 있어야 함.',
     created_at:nowISO(),
   };
@@ -662,9 +781,10 @@ function seedDemo() {
     db.cases.push(c);
     if (['통과','오류','확인필요'].includes(status)) {
       const errData = (status==='오류'&&t.error_key) ? DEMO_ERRORS[t.error_key] : null;
+      const checkStep = status==='확인필요' ? 6 : null;
       db.results.push({
         id:nextId('results'), case_id:c.id, status,
-        fail_step:      errData?errData.fail_step:null,
+        fail_step:      errData?errData.fail_step:checkStep,
         error_category: errData?errData.cat:null,
         error_title:    errData?errData.title:null,
         repro_steps:    errData?JSON.stringify(errData.repro):null,
